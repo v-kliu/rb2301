@@ -60,10 +60,18 @@ class ObstacleCourseNode(Node):
 
         self.last_scan = None
         self.pose = None
-        self.last_heading = None
-        self.move_speed = 0.2
+        self.move_speed = 0.3
+        self.detection_thresholds = [0.18, 0.18, 0.18, 0.18]
 
         # field variable to keep track of permanant blockage
+        self.blocked_second_priority_forward = False
+        self.blocked_third_priority_forward = False
+        self.blocked_fourth_priority_forward = False
+
+        self.blocked_second_priority_right = False
+        self.blocked_third_priority_right = False
+        self.blocked_fourth_priority_right = False
+
         self.blocked_right = False
 
     def sub_scan_callback(self, msg):
@@ -116,6 +124,84 @@ class ObstacleCourseNode(Node):
             currMin = min(currMin, lid[offset - angle])
 
         return currMin
+    
+    # anytime going forward, prioritize going forward, then right, then left, then all the way to the right, then go back looking for right
+    def prioritizeForwardMovement(self, directions):
+        # forward moving logic
+
+        # if forward is greater than threshold go forward
+        if (directions[0] > self.detection_thresholds[0] and not self.blocked_third_priority_forward):
+            self.move_2D(self.move_speed, 0.0, 0.0)
+            self.blocked_second_priority_forward = False
+            self.blocked_third_priority_forward = False
+            self.blocked_fourth_priority_forward = False
+            self.get_logger().debug("MOVE FORWARD")
+            return True
+        # forward is blocked, if haven't explored right (second priority) and not blocked go right
+        elif (directions[3] > self.detection_thresholds[3] and not self.blocked_second_priority_forward):
+            self.move_2D(0, -self.move_speed, 0.0)
+            self.get_logger().debug("MOVE RIGHT")
+        # forward and right is blocked, if haven't explored left (third priority) and not blocked go left
+        elif (directions[1] > self.detection_thresholds[1] and not self.blocked_third_priority_forward):
+            self.blocked_second_priority_forward = True
+            self.move_2D(0, self.move_speed, 0.0)
+            self.get_logger().debug("MOVE LEFT")
+        # blocked forward right left, need to backtrack somewhere, go all the way right and then go back looking for right
+        else: 
+            self.blocked_third_priority_forward = True
+            # need to go back right
+            if (directions[3] > self.detection_thresholds[3] and not self.blocked_fourth_priority_forward):
+                self.move_2D(0, -self.move_speed, 0.0)
+                self.get_logger().debug("MOVE TO RIGHT AGAIN")
+            else:
+                self.blocked_fourth_priority_forward = True
+                self.get_logger().debug("HIT RIGHT AGAIN CALLING PRIORITIZE RIGHT")
+                # now start going left until you can go down 
+                if (self.prioritizeRightMovement(directions)): # if true then moved right at some point
+                    self.get_logger().debug("RESET")
+                    self.blocked_second_priority_forward = False
+                    self.blocked_third_priority_forward = False
+                    self.blocked_fourth_priority_forward = False
+            
+    # anytime going right, prioritize going right, then up, then down, then all the way up, then go back up looking for left
+    def prioritizeRightMovement(self, directions):
+        # right moving logic
+
+        # if right is greater than threshold go right
+        if (directions[3] > self.detection_thresholds[3] and not self.blocked_third_priority_right):
+            self.move_2D(0.0, -self.move_speed, 0.0)
+            self.blocked_second_priority_right = False
+            self.blocked_third_priority_right = False
+            self.blocked_fourth_priority_right = False
+            self.get_logger().debug("MOVE RIGHT")
+            return True
+        # right is blocked, if haven't explored up (second priority) and not blocked go up
+        elif (directions[0] > self.detection_thresholds[0] and not self.blocked_second_priority_right):
+            self.move_2D(self.move_speed, 0.0, 0.0)
+            self.get_logger().debug("MOVE FORWARD")
+        # right and up is blocked, if haven't explored down (third priority) and not blocked go down
+        elif (directions[2] > self.detection_thresholds[2] and not self.blocked_third_priority_right):
+            self.blocked_second_priority_right = True
+            self.move_2D(-self.move_speed, 0.0, 0.0)
+            self.get_logger().debug("MOVE DOWN")
+        # blocked right up down, need to backtrack somewhere, go all the way up and then go left
+        else: 
+            self.blocked_third_priority_right = True
+            # need to go back up
+            if (directions[0] > self.detection_thresholds[0] and not self.blocked_fourth_priority_right):
+                self.move_2D(self.move_speed, 0.0, 0.0)
+                self.get_logger().debug("MOVE TO UP AGAIN")
+            else:
+                self.blocked_fourth_priority_right = True
+                self.get_logger().debug("HIT UP AGAIN CALLING PRIORITIZE FORWARD")
+                # now start going left until you can go up 
+                if (self.prioritizeForwardMovement(directions)): # if true then moved right at some point
+                    self.get_logger().debug("RESET")
+                    self.blocked_second_priority_right = False
+                    self.blocked_third_priority_right = False
+                    self.blocked_fourth_priority_right = False
+
+    # anytime going right, prioritize going right, then up, then down, then all the way to the top, then go left looking for up
 
     def timer_callback(self):
         if self.last_scan is None:
@@ -125,87 +211,76 @@ class ObstacleCourseNode(Node):
         if self.pose is None:
             print("No pose detected")
             return # Does not run if no pose received from Odom or Optitrack
-        elif self.pose[2] == self.last_heading:
-            self.get_logger().debug("HEADING CHANGED, STOPPING")
 
         elif np.linalg.norm(self.pose[:2] - self.goal_coordinates) < 0.05: # If distance to goal is less than 0.05m, consider goal reached and exit
             self.get_logger().info("Goal reached! Exiting script")
             raise SystemExit
         
         ###### INSERT CODE HERE ######
-        # self.get_logger().info(f"Pose: {self.pose}")
+        self.get_logger().info(f"Pose: {self.pose}")
         # self.move_2D(0.1)
 
-        '''
-        # first split the lidar, reused from ca1
-        lid = self.last_scan
-        # forward is : 0 +- 50 degrees
-        forward_results = [lid[0], lid[1], lid[35], lid[2], lid[34], lid[3], lid[33], lid[4], lid[32], lid[5], lid[31]]
-        # left is : 90 degrees +- 20 degrees
-        left_results = [lid[9], lid[10], lid[11], lid[8], lid[7]]
-        # back is : 180 +- 20 degrees
-        back_results = [lid[18], lid[17], lid[16], lid[19], lid[20]]
-        # right is : 270 +- 20 degrees
-        right_results = [lid[27], lid[28], lid[29], lid[26], lid[25]]
-
-        # create direction array first
-        directions = np.zeros(4)
-        directions[0] = min(forward_results) # forward
-        directions[1] = min(left_results) # left
-        directions[2] = min(back_results) # back
-        directions[3] = min(right_results) # right
-        '''
         # create direction array first
         directions = np.zeros(4)
         directions[0] = self.getMinDistanceInRange(0, 40) # forward
-        directions[1] = self.getMinDistanceInRange(90, 40) # left
+        directions[1] = self.getMinDistanceInRange(90, 60) # left
         directions[2] = self.getMinDistanceInRange(180, 40) # back
-        directions[3] = self.getMinDistanceInRange(270, 40) # right
+        directions[3] = self.getMinDistanceInRange(270, 60) # right
 
 
         # [0.3, 0.2, inf, 0.2] OLD THRESHOLDS from CA1
-        detection_thresholds = [0.12, 0.12, 0, 0.12]
         blocked_info = ""
         # print debugging line
-        if (directions[0] > detection_thresholds[0]) : blocked_info += "FRONT NOT BLOCKED, "
+        if (directions[0] > self.detection_thresholds[0]) : blocked_info += "FRONT NOT BLOCKED, "
         else : blocked_info += "FRONT BLOCKED (" + str(directions[0]) + "), "
-        if (directions[3] > detection_thresholds[3]) : blocked_info += "RIGHT NOT BLOCKED, "
+        if (directions[3] > self.detection_thresholds[3]) : blocked_info += "RIGHT NOT BLOCKED, "
         else : blocked_info += "RIGHT BLOCKED (" + str(directions[3]) + "), "
-        if (directions[1] > detection_thresholds[1]) : blocked_info += "LEFT NOT BLOCKED, "
+        if (directions[1] > self.detection_thresholds[1]) : blocked_info += "LEFT NOT BLOCKED, "
         else: blocked_info += "LEFT BLOCKED (" + str(directions[1]) + "), "
-        if (np.isinf(directions[2])) : blocked_info += "BACK NOT BLOCKED"
+        if (directions[2] > self.detection_thresholds[2]) : blocked_info += "BACK NOT BLOCKED"
         else : blocked_info += "BACK BLOCKED (" + str(directions[2]) + "), "
 
         self.get_logger().debug(blocked_info)
 
+        '''
         # forward moving logic
         # if forward is infinity (clear) or greater than 0.3
-        if (directions[0] > detection_thresholds[0]):
+        if (directions[0] > self.detection_thresholds[0]):
             self.move_2D(self.move_speed, 0.0, 0.0)
             self.blocked_right = False
             self.get_logger().debug("MOVE FORWARD")
         # if right is clear and greater than 2 go left
-        elif (directions[3] > detection_thresholds[3] and not self.blocked_right):
+        elif (directions[3] > self.detection_thresholds[3] and not self.blocked_right):
             self.move_2D(0, -self.move_speed, 0.0)
             self.get_logger().debug("MOVE RIGHT")
         # if left is clear and greater than 2 go right
-        elif (directions[1] > detection_thresholds[1]):
+        elif (directions[1] > self.detection_thresholds[1]):
             self.blocked_right = True
             self.move_2D(0, self.move_speed, 0.0)
             self.get_logger().debug("MOVE LEFT")
         # if back is clear go back
-        elif (np.isinf(directions[2])):
+        elif (directions[2] > self.detection_thresholds[2]):
             self.move_2D(-self.move_speed, 0.0, 0.0)
             self.get_logger().debug("MOVE BACK")
         # else, somehow we are trapped and breakS
         else:
             self.get_logger().debug("")
+        '''
+            
+        # INTENDED
+        # if pose is within forward part of zig zag, prioritize up
+        # y is 1.35
+        # x -1.8
+        # else, prioritize right
+
+        if (self.pose[0] < 1.30 or self.pose[1] < -1.8):
+            self.prioritizeForwardMovement(directions)
+        else: 
+            self.prioritizeRightMovement(directions)
 
         self.get_logger().debug(str(self.pose[2]))
 
         # again want to constanatly move up and right
-
-
 
         ###### INSERT CODE HERE ######
                 
