@@ -9,7 +9,7 @@ from geometry_msgs.msg import Twist
 from sensor_msgs.msg import LaserScan
 
 np.set_printoptions(2, suppress=True, threshold=np.inf) # Print numpy arrays to specified d.p., suppress scientific notation and do not truncate
-set_logger_level("obstaclecourse", level=LoggingSeverity.INFO) # Configure to either LoggingSeverity.INFO or LoggingSeverity.DEBUG  
+set_logger_level("obstaclecourse", level=LoggingSeverity.DEBUG) # Configure to either LoggingSeverity.INFO or LoggingSeverity.DEBUG  
 
 class LidarNode(Node):
     def __init__(self):
@@ -58,7 +58,13 @@ class ObstacleCourseNode(Node):
         self.publisher_ = self.create_publisher(Twist, 'cmd_vel', 10) # Publish to cmd_vel node       
         self.timer = self.create_timer(0.05, self.timer_callback)  # Runs at 20Hz. Can be changed.
 
+        self.last_scan = None
         self.pose = None
+        self.last_heading = None
+        self.move_speed = 0.2
+
+        # field variable to keep track of permanant blockage
+        self.blocked_right = False
 
     def sub_scan_callback(self, msg):
         """Scan subscriber"""
@@ -99,19 +105,108 @@ class ObstacleCourseNode(Node):
         twist_msg.angular.x, twist_msg.angular.y, twist_msg.angular.z = 0.0, 0.0, float(turn)
         self.publisher_.publish(twist_msg)
 
+    # gets the minimum distance in range of values
+    def getMinDistanceInRange(self, offset, rangeOfView):
+        lid = self.last_scan
+        currMin = lid[offset]
+
+        # incorporate angles from [-rangeOfView + offset, offset + rangeOfView]
+        for angle in range(1, rangeOfView):
+            currMin = min(currMin, lid[offset + angle])
+            currMin = min(currMin, lid[offset - angle])
+
+        return currMin
+
     def timer_callback(self):
+        if self.last_scan is None:
+            return # Does not run if the laser message is not received.
+    
         """Controller loop. Insert path planning and PID control logic here"""
         if self.pose is None:
             print("No pose detected")
             return # Does not run if no pose received from Odom or Optitrack
-            
+        elif self.pose[2] == self.last_heading:
+            self.get_logger().debug("HEADING CHANGED, STOPPING")
+
         elif np.linalg.norm(self.pose[:2] - self.goal_coordinates) < 0.05: # If distance to goal is less than 0.05m, consider goal reached and exit
             self.get_logger().info("Goal reached! Exiting script")
             raise SystemExit
         
         ###### INSERT CODE HERE ######
-        self.get_logger().info(f"Pose: {self.pose}")
-        self.move_2D(0.1)
+        # self.get_logger().info(f"Pose: {self.pose}")
+        # self.move_2D(0.1)
+
+        '''
+        # first split the lidar, reused from ca1
+        lid = self.last_scan
+        # forward is : 0 +- 50 degrees
+        forward_results = [lid[0], lid[1], lid[35], lid[2], lid[34], lid[3], lid[33], lid[4], lid[32], lid[5], lid[31]]
+        # left is : 90 degrees +- 20 degrees
+        left_results = [lid[9], lid[10], lid[11], lid[8], lid[7]]
+        # back is : 180 +- 20 degrees
+        back_results = [lid[18], lid[17], lid[16], lid[19], lid[20]]
+        # right is : 270 +- 20 degrees
+        right_results = [lid[27], lid[28], lid[29], lid[26], lid[25]]
+
+        # create direction array first
+        directions = np.zeros(4)
+        directions[0] = min(forward_results) # forward
+        directions[1] = min(left_results) # left
+        directions[2] = min(back_results) # back
+        directions[3] = min(right_results) # right
+        '''
+        # create direction array first
+        directions = np.zeros(4)
+        directions[0] = self.getMinDistanceInRange(0, 40) # forward
+        directions[1] = self.getMinDistanceInRange(90, 40) # left
+        directions[2] = self.getMinDistanceInRange(180, 40) # back
+        directions[3] = self.getMinDistanceInRange(270, 40) # right
+
+
+        # [0.3, 0.2, inf, 0.2] OLD THRESHOLDS from CA1
+        detection_thresholds = [0.12, 0.12, 0, 0.12]
+        blocked_info = ""
+        # print debugging line
+        if (directions[0] > detection_thresholds[0]) : blocked_info += "FRONT NOT BLOCKED, "
+        else : blocked_info += "FRONT BLOCKED (" + str(directions[0]) + "), "
+        if (directions[3] > detection_thresholds[3]) : blocked_info += "RIGHT NOT BLOCKED, "
+        else : blocked_info += "RIGHT BLOCKED (" + str(directions[3]) + "), "
+        if (directions[1] > detection_thresholds[1]) : blocked_info += "LEFT NOT BLOCKED, "
+        else: blocked_info += "LEFT BLOCKED (" + str(directions[1]) + "), "
+        if (np.isinf(directions[2])) : blocked_info += "BACK NOT BLOCKED"
+        else : blocked_info += "BACK BLOCKED (" + str(directions[2]) + "), "
+
+        self.get_logger().debug(blocked_info)
+
+        # forward moving logic
+        # if forward is infinity (clear) or greater than 0.3
+        if (directions[0] > detection_thresholds[0]):
+            self.move_2D(self.move_speed, 0.0, 0.0)
+            self.blocked_right = False
+            self.get_logger().debug("MOVE FORWARD")
+        # if right is clear and greater than 2 go left
+        elif (directions[3] > detection_thresholds[3] and not self.blocked_right):
+            self.move_2D(0, -self.move_speed, 0.0)
+            self.get_logger().debug("MOVE RIGHT")
+        # if left is clear and greater than 2 go right
+        elif (directions[1] > detection_thresholds[1]):
+            self.blocked_right = True
+            self.move_2D(0, self.move_speed, 0.0)
+            self.get_logger().debug("MOVE LEFT")
+        # if back is clear go back
+        elif (np.isinf(directions[2])):
+            self.move_2D(-self.move_speed, 0.0, 0.0)
+            self.get_logger().debug("MOVE BACK")
+        # else, somehow we are trapped and breakS
+        else:
+            self.get_logger().debug("")
+
+        self.get_logger().debug(str(self.pose[2]))
+
+        # again want to constanatly move up and right
+
+
+
         ###### INSERT CODE HERE ######
                 
 
