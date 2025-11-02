@@ -61,7 +61,7 @@ class ObstacleCourseNode(Node):
         self.last_scan = None
         self.pose = None
         self.move_speed = 0.3
-        self.detection_thresholds = [0.18, 0.18, 0.18, 0.18]
+        self.detection_thresholds = [0.18, 0.20, 0.22, 0.20]
 
         # field variable to keep track of permanant blockage
         self.blocked_second_priority_forward = False
@@ -73,6 +73,11 @@ class ObstacleCourseNode(Node):
         self.blocked_fourth_priority_right = False
 
         self.blocked_right = False
+
+        # NEW STATE MACHINE VARIABLES
+        self.current_state = "NAV_FORWARD" # Start by navigating forward
+        self.intended_corridor = "NAV_FORWARD"
+
 
     def sub_scan_callback(self, msg):
         """Scan subscriber"""
@@ -126,7 +131,7 @@ class ObstacleCourseNode(Node):
         return currMin
     
     # anytime going forward, prioritize going forward, then right, then left, then all the way to the right, then go back looking for right
-    def prioritizeForwardMovement(self, directions):
+    def navigate_forward_logic(self, directions):
         # forward moving logic
 
         # if forward is greater than threshold go forward
@@ -135,36 +140,38 @@ class ObstacleCourseNode(Node):
             self.blocked_second_priority_forward = False
             self.blocked_third_priority_forward = False
             self.blocked_fourth_priority_forward = False
-            self.get_logger().debug("MOVE FORWARD")
-            return True
+            self.get_logger().debug("STATE: NAV_FORWARD - Moving Forward")
+            
         # forward is blocked, if haven't explored right (second priority) and not blocked go right
         elif (directions[3] > self.detection_thresholds[3] and not self.blocked_second_priority_forward):
             self.move_2D(0, -self.move_speed, 0.0)
-            self.get_logger().debug("MOVE RIGHT")
+            self.get_logger().debug("STATE: NAV_FORWARD - Moving Right (P2)")
         # forward and right is blocked, if haven't explored left (third priority) and not blocked go left
         elif (directions[1] > self.detection_thresholds[1] and not self.blocked_third_priority_forward):
             self.blocked_second_priority_forward = True
             self.move_2D(0, self.move_speed, 0.0)
-            self.get_logger().debug("MOVE LEFT")
+            self.get_logger().debug("STATE: NAV_FORWARD - Moving Left (P3)")
         # blocked forward right left, need to backtrack somewhere, go all the way right and then go back looking for right
         else: 
             self.blocked_third_priority_forward = True
             # need to go back right
             if (directions[3] > self.detection_thresholds[3] and not self.blocked_fourth_priority_forward):
                 self.move_2D(0, -self.move_speed, 0.0)
-                self.get_logger().debug("MOVE TO RIGHT AGAIN")
+                self.get_logger().debug("STATE: NAV_FORWARD - Moving Right (P4)")
             else:
                 self.blocked_fourth_priority_forward = True
-                self.get_logger().debug("HIT RIGHT AGAIN CALLING PRIORITIZE RIGHT")
-                # now start going left until you can go down 
-                if (self.prioritizeRightMovement(directions)): # if true then moved right at some point
-                    self.get_logger().debug("RESET")
-                    self.blocked_second_priority_forward = False
-                    self.blocked_third_priority_forward = False
-                    self.blocked_fourth_priority_forward = False
+                self.get_logger().debug("STATE: NAV_FORWARD - BLOCKED! Handing off to BACKTRACK_FROM_FORWARD state.")
+                
+                # RESET FLAGS for this state
+                self.blocked_second_priority_forward = False
+                self.blocked_third_priority_forward = False
+                self.blocked_fourth_priority_forward = False
+
+                # SET NEW STATE
+                self.current_state = "BACKTRACK_FROM_FORWARD"
             
     # anytime going right, prioritize going right, then up, then down, then all the way up, then go back up looking for left
-    def prioritizeRightMovement(self, directions):
+    def navigate_right_logic(self, directions):
         # right moving logic
 
         # if right is greater than threshold go right
@@ -173,35 +180,69 @@ class ObstacleCourseNode(Node):
             self.blocked_second_priority_right = False
             self.blocked_third_priority_right = False
             self.blocked_fourth_priority_right = False
-            self.get_logger().debug("MOVE RIGHT")
-            return True
+            self.get_logger().debug("STATE: NAV_RIGHT - Moving Right")
+            
         # right is blocked, if haven't explored up (second priority) and not blocked go up
         elif (directions[0] > self.detection_thresholds[0] and not self.blocked_second_priority_right):
             self.move_2D(self.move_speed, 0.0, 0.0)
-            self.get_logger().debug("MOVE FORWARD")
+            self.get_logger().debug("STATE: NAV_RIGHT - Moving Forward (P2)")
         # right and up is blocked, if haven't explored down (third priority) and not blocked go down
         elif (directions[2] > self.detection_thresholds[2] and not self.blocked_third_priority_right):
             self.blocked_second_priority_right = True
             self.move_2D(-self.move_speed, 0.0, 0.0)
-            self.get_logger().debug("MOVE DOWN")
+            self.get_logger().debug("STATE: NAV_RIGHT - Moving Down (P3)")
         # blocked right up down, need to backtrack somewhere, go all the way up and then go left
         else: 
             self.blocked_third_priority_right = True
             # need to go back up
             if (directions[0] > self.detection_thresholds[0] and not self.blocked_fourth_priority_right):
                 self.move_2D(self.move_speed, 0.0, 0.0)
-                self.get_logger().debug("MOVE TO UP AGAIN")
+                self.get_logger().debug("STATE: NAV_RIGHT - Moving Forward (P4)")
             else:
                 self.blocked_fourth_priority_right = True
-                self.get_logger().debug("HIT UP AGAIN CALLING PRIORITIZE FORWARD")
-                # now start going left until you can go up 
-                if (self.prioritizeForwardMovement(directions)): # if true then moved right at some point
-                    self.get_logger().debug("RESET")
-                    self.blocked_second_priority_right = False
-                    self.blocked_third_priority_right = False
-                    self.blocked_fourth_priority_right = False
+                self.get_logger().debug("STATE: NAV_RIGHT - BLOCKED! Handing off to BACKTRACK_FROM_RIGHT state.")
+                
+                # RESET FLAGS for this state
+                self.blocked_second_priority_right = False
+                self.blocked_third_priority_right = False
+                self.blocked_fourth_priority_right = False
+                
+                # SET NEW STATE
+                self.current_state = "BACKTRACK_FROM_RIGHT"
 
-    # anytime going right, prioritize going right, then up, then down, then all the way to the top, then go left looking for up
+    def backtrack_from_forward_logic(self, directions):
+        self.get_logger().debug("STATE: BACKTRACK_FROM_FORWARD - Trying to find Right path")
+        # P1: Try Right (Goal)
+        if (directions[3] > self.detection_thresholds[3]):
+            self.move_2D(0, -self.move_speed, 0.0)
+            self.get_logger().debug("STATE: BACKTRACK_FROM_FORWARD - Found Right! Returning to normal nav.")
+            self.current_state = self.intended_corridor # Go back to normal
+        # P2: Try Back (Escape)
+        elif (directions[2] > self.detection_thresholds[2]):
+            self.move_2D(-self.move_speed, 0.0, 0.0) 
+            self.get_logger().debug("STATE: BACKTRACK_FROM_FORWARD - Right blocked, trying Back")
+        # P3: Try Left (Last resort)
+        else:
+            self.move_2D(0.0, self.move_speed, 0.0) 
+            self.get_logger().debug("STATE: BACKTRACK_FROM_FORWARD - Right/Back blocked, trying Left")
+
+    def backtrack_from_right_logic(self, directions):
+        self.get_logger().debug("STATE: BACKTRACK_FROM_RIGHT - Trying to find Forward path")
+        # Applying the same logic: Goal -> Escape -> Last Resort
+        # P1: Try Forward (Goal)
+        if (directions[0] > self.detection_thresholds[0]):
+            self.move_2D(self.move_speed, 0.0, 0.0)
+            self.get_logger().debug("STATE: BACKTRACK_FROM_RIGHT - Found Forward! Returning to normal nav.")
+            self.current_state = self.intended_corridor # Go back to normal
+        # P2: Try Left (Escape - 'Back' relative to this corridor)
+        elif (directions[1] > self.detection_thresholds[1]):
+            self.move_2D(0.0, self.move_speed, 0.0) 
+            self.get_logger().debug("STATE: BACKTRACK_FROM_RIGHT - Forward blocked, trying Left")
+        # P3: Try Down (Last resort)
+        else:
+            self.move_2D(-self.move_speed, 0.0, 0.0) 
+            self.get_logger().debug("STATE: BACKTRACK_FROM_RIGHT - Forward/Left blocked, trying Down")
+
 
     def timer_callback(self):
         if self.last_scan is None:
@@ -223,9 +264,9 @@ class ObstacleCourseNode(Node):
         # create direction array first
         directions = np.zeros(4)
         directions[0] = self.getMinDistanceInRange(0, 40) # forward
-        directions[1] = self.getMinDistanceInRange(90, 60) # left
+        directions[1] = self.getMinDistanceInRange(90, 50) # left
         directions[2] = self.getMinDistanceInRange(180, 40) # back
-        directions[3] = self.getMinDistanceInRange(270, 60) # right
+        directions[3] = self.getMinDistanceInRange(270, 50) # right
 
 
         # [0.3, 0.2, inf, 0.2] OLD THRESHOLDS from CA1
@@ -269,14 +310,31 @@ class ObstacleCourseNode(Node):
             
         # INTENDED
         # if pose is within forward part of zig zag, prioritize up
-        # y is 1.35
-        # x -1.8
+        # TRIGGER LINE 1 : y is 1.30
+        # TRIGGER LINE 2 : x -1.8
         # else, prioritize right
 
-        if (self.pose[0] < 1.30 or self.pose[1] < -1.8):
-            self.prioritizeForwardMovement(directions)
+        # NEW STATE MACHINE DISPATCHER
+        # 1. Check world-frame pose to decide *intent*
+        if (self.pose[0] < 1.2 or self.pose[1] < -1.8):
+            self.intended_corridor = "NAV_FORWARD"
         else: 
-            self.prioritizeRightMovement(directions)
+            self.intended_corridor = "NAV_RIGHT"
+
+        # 2. If we aren't backtracking, follow the intended corridor
+        if "BACKTRACK" not in self.current_state:
+            self.current_state = self.intended_corridor
+
+        # 3. STATE MACHINE DISPATCHER
+        if self.current_state == "NAV_FORWARD":
+            self.navigate_forward_logic(directions)
+        elif self.current_state == "NAV_RIGHT":
+            self.navigate_right_logic(directions)
+        elif self.current_state == "BACKTRACK_FROM_FORWARD":
+            self.backtrack_from_forward_logic(directions)
+        elif self.current_state == "BACKTRACK_FROM_RIGHT":
+            self.backtrack_from_right_logic(directions)
+
 
         self.get_logger().debug(str(self.pose[2]))
 
