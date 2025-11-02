@@ -61,7 +61,8 @@ class ObstacleCourseNode(Node):
         self.last_scan = None
         self.pose = None
         self.move_speed = 0.3
-        self.detection_thresholds = [0.18, 0.20, 0.24, 0.20]
+        self.detection_thresholds = [0.18, 0.20, 0.24, 0.20] # self boundaries # self.detection_thresholds = [0.18, 0.20, 0.24, 0.20] # self boundaries
+        self.gate_detection_threshold = 0.35 # gate boundaries
 
         # field variable to keep track of permanant blockage
         self.blocked_second_priority_forward = False
@@ -72,8 +73,11 @@ class ObstacleCourseNode(Node):
         self.blocked_third_priority_right = False
         self.blocked_fourth_priority_right = False
 
-        self.trigger_one = False
-        self.trigger_two = False
+        self.checkpoint_one = True
+        self.checkpoint_two = True
+        self.checkpoint_three = False
+
+        self.swing_count = 0
 
         self.current_state = "NAV_FORWARD" 
         self.intended_corridor = "NAV_FORWARD"
@@ -135,10 +139,16 @@ class ObstacleCourseNode(Node):
 
         # if forward is greater than threshold go forward
         if (directions[0] > self.detection_thresholds[0] and not self.blocked_third_priority_forward):
-            self.move_2D(self.move_speed, 0.0, 0.0)
-            self.blocked_second_priority_forward = False
-            self.blocked_third_priority_forward = False
-            self.blocked_fourth_priority_forward = False
+            # if passed second checkpoint and passing through gate (left and right are both blocked)
+            if (self.checkpoint_two and directions[1] < self.gate_detection_threshold and directions[3] < self.gate_detection_threshold) : 
+                self.swing_count += 1
+                self.move_2D(0.0, 0.0, 0.0)
+                self.get_logger().debug(f"SWINGS COUNTED {self.swing_count}")
+            else:
+                self.move_2D(self.move_speed, 0.0, 0.0)
+                self.blocked_second_priority_forward = False
+                self.blocked_third_priority_forward = False
+                self.blocked_fourth_priority_forward = False
             self.get_logger().debug("STATE: NAV_FORWARD - Moving Forward")
             
         # forward is blocked, if haven't explored right (second priority) and not blocked go right
@@ -256,7 +266,7 @@ class ObstacleCourseNode(Node):
             raise SystemExit
         
         ###### INSERT CODE HERE ######
-        self.get_logger().info(f"Pose: {self.pose}")
+        
         # self.move_2D(0.1)
 
         # create direction array first
@@ -265,6 +275,12 @@ class ObstacleCourseNode(Node):
         directions[1] = self.getMinDistanceInRange(90, 50) # left
         directions[2] = self.getMinDistanceInRange(180, 40) # back
         directions[3] = self.getMinDistanceInRange(270, 50) # right
+
+        if (self.checkpoint_two) :
+            directions[1] = self.getMinDistanceInRange(90, 5) # left
+            directions[3] = self.getMinDistanceInRange(270, 5) # right
+
+        self.get_logger().info(f"Pose: {self.pose} and Directions: [{directions[0]}, {directions[1]}, {directions[2]}, {directions[3]}")
 
 
         # [0.3, 0.2, inf, 0.2] OLD THRESHOLDS from CA1
@@ -286,17 +302,17 @@ class ObstacleCourseNode(Node):
         # TRIGGER LINE 1 : y is 1.2 (slightl later becuase circle can spawn in middle -> should not optimzie for gazebo)
         # TRIGGER LINE 2 : x -1.8 (more aggresive should go forward no buggy circle to worry about)
         # else, prioritize right
-        if (not self.trigger_one):
+        if (not self.checkpoint_one):
             # we are in Corridor 1
             self.intended_corridor = "NAV_FORWARD"
             if (self.pose[0] > 1.2): # Check for exit condition
-                self.trigger_one = True
+                self.checkpoint_one = True
                 self.get_logger().info("--- COMPLETED CORRIDOR 1, ENTERING CORRIDOR 2 ---")
-        elif (not self.trigger_two):
+        elif (not self.checkpoint_two):
             # we are in Corridor 2
             self.intended_corridor = "NAV_RIGHT"
             if (self.pose[1] < -1.8): # Check for exit condition
-                self.trigger_two = True
+                self.checkpoint_two = True
                 self.get_logger().info("--- COMPLETED CORRIDOR 2, ENTERING CORRIDOR 3 ---")
         else:
             # we are in Corridor 3
