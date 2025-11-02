@@ -9,7 +9,7 @@ from geometry_msgs.msg import Twist
 from sensor_msgs.msg import LaserScan
 
 np.set_printoptions(2, suppress=True, threshold=np.inf) # Print numpy arrays to specified d.p., suppress scientific notation and do not truncate
-set_logger_level("obstaclecourse", level=LoggingSeverity.DEBUG) # Configure to either LoggingSeverity.INFO or LoggingSeverity.DEBUG  
+set_logger_level("obstaclecourse", level=LoggingSeverity.ERROR) # Configure to either LoggingSeverity.INFO or LoggingSeverity.DEBUG  
 
 class LidarNode(Node):
     def __init__(self):
@@ -73,11 +73,20 @@ class ObstacleCourseNode(Node):
         self.blocked_third_priority_right = False
         self.blocked_fourth_priority_right = False
 
-        self.checkpoint_one = True
-        self.checkpoint_two = True
+        self.checkpoint_one = False
+        self.checkpoint_two = False
         self.checkpoint_three = False
 
         self.swing_count = 0
+
+        # NEW PENDULUM STATE MACHINE
+        self.pendulum_state = "APPROACHING_GATE_1" # "APPROACHING_GATE_1", "TIMING_GATE_1_WAIT_FOR_AWAY", "TIMING_GATE_1_WAIT_FOR_RETURN", "WAITING_FOR_GAP_1", "PASSING_GATE_1", "TIMING_GATE_2_WAIT_FOR_AWAY", "TIMING_GATE_2_WAIT_FOR_RETURN", "WAITING_FOR_GAP_2", "PASSING_GATE_2", "FINAL_RUN", "DONE"
+        self.pendulum_timer = 0
+        self.pendulum_first_hit_time = 0
+        self.pendulum_period_ticks = 0
+        self.dynamic_move_speed = self.move_speed
+        self.pendulum_hit_threshold = 0.18 # User-specified
+        self.gate_pass_start_time = 0
 
         self.current_state = "NAV_FORWARD" 
         self.intended_corridor = "NAV_FORWARD"
@@ -137,18 +146,162 @@ class ObstacleCourseNode(Node):
     def navigate_forward_logic(self, directions):
         # forward moving logic
 
+        # --- NEW TOP-LEVEL CHECK ---
+        # If we are in Corridor 3 (past checkpoint_two) AND we've passed the gate (checkpoint_three),
+        # run the PENDULUM logic exclusively.
+        if (self.checkpoint_two and self.checkpoint_three):
+            
+            # --- PENDULUM STATE MACHINE (Runs only after checkpoint_three is True) ---
+            forward_dist = directions[0]
+            self.pendulum_timer += 1 # Increment timer every tick (0.05s)
+            
+            # State: APPROACHING_GATE_1
+            if self.pendulum_state == "APPROACHING_GATE_1":
+                approaching_speed = self.move_speed / 4.0 # Move at 1/4 speed
+
+                if forward_dist < self.pendulum_hit_threshold:
+                    self.get_logger().info("PENDULUM: Hit Gate 1. Stopping to time.")
+                    self.pendulum_state = "TIMING_GATE_1_WAIT_FOR_AWAY"
+                    self.pendulum_first_hit_time = self.pendulum_timer
+                    self.move_2D(0.0, 0.0, 0.0)
+                else:
+                    self.move_2D(approaching_speed, 0.0, 0.0) # Approach gate 1 slowly
+
+            # State: TIMING_GATE_1_WAIT_FOR_AWAY
+            elif self.pendulum_state == "TIMING_GATE_1_WAIT_FOR_AWAY":
+                self.move_2D(0.0, 0.0, 0.0) # Stay still
+                if forward_dist > self.pendulum_hit_threshold:
+                    self.get_logger().info("PENDULUM: Gate 1 swinging away.")
+                    self.pendulum_state = "TIMING_GATE_1_WAIT_FOR_RETURN"
+
+            # State: TIMING_GATE_1_WAIT_FOR_RETURN
+            elif self.pendulum_state == "TIMING_GATE_1_WAIT_FOR_RETURN":
+                self.move_2D(0.0, 0.0, 0.0) # Stay still
+                if forward_dist < self.pendulum_hit_threshold:
+                    self.pendulum_period_ticks = self.pendulum_timer - self.pendulum_first_hit_time
+                    self.get_logger().info(f"PENDULUM: Gate 1 returned. Period: {self.pendulum_period_ticks * 0.05}s")
+                    self.pendulum_state = "WAITING_FOR_GAP_1"
+
+            # State: WAITING_FOR_GAP_1
+            elif self.pendulum_state == "WAITING_FOR_GAP_1":
+                self.move_2D(0.0, 0.0, 0.0) # Stay still
+                if forward_dist > self.pendulum_hit_threshold:
+                    # Gap is open! Calculate speed and GO.
+                    period_sec = self.pendulum_period_ticks * 0.05
+                    if period_sec <= 0: period_sec = 3 # Safety for divide by zero
+                    
+                    # k = base_speed * base_period = 0.3 * 3s = 0.9 (Assuming base 3s period)
+                    # Speed is inversely proportional to period: speed = k / period
+                    # A fast swing (2s) = 0.9/2 = 0.45 (clipped to 0.3)
+                    # A slow swing (5s) = 0.9/5 = 0.18
+                    k = 0.9 
+                    self.dynamic_move_speed = np.clip(k / period_sec, 0.1, self.max_translate_velocity)
+                    
+                    self.get_logger().info(f"PENDULUM: Gate 1 gap open! Moving at {self.dynamic_move_speed} m/s")
+                    self.pendulum_state = "PASSING_GATE_1"
+                    self.move_2D(self.dynamic_move_speed, 0.0, 0.0)
+
+            # State: PASSING_GATE_1
+            elif self.pendulum_state == "PASSING_GATE_1":
+                if forward_dist < self.pendulum_hit_threshold:
+                    # We hit Gate 2
+                    self.get_logger().info("PENDULUM: Hit Gate 2. Stopping to time.")
+                    self.pendulum_state = "TIMING_GATE_2_WAIT_FOR_AWAY"
+                    self.pendulum_first_hit_time = self.pendulum_timer
+                    self.move_2D(0.0, 0.0, 0.0)
+                else:
+                    self.move_2D(self.dynamic_move_speed, 0.0, 0.0) # Keep moving
+
+            # --- (Repeat logic for Gate 2) ---
+
+            # State: TIMING_GATE_2_WAIT_FOR_AWAY
+            elif self.pendulum_state == "TIMING_GATE_2_WAIT_FOR_AWAY":
+                self.move_2D(0.0, 0.0, 0.0) # Stay still
+                if forward_dist > self.pendulum_hit_threshold:
+                    self.get_logger().info("PENDULUM: Gate 2 swinging away.")
+                    self.pendulum_state = "TIMING_GATE_2_WAIT_FOR_RETURN"
+
+            # State: TIMING_GATE_2_WAIT_FOR_RETURN
+            elif self.pendulum_state == "TIMING_GATE_2_WAIT_FOR_RETURN":
+                self.move_2D(0.0, 0.0, 0.0) # Stay still
+                if forward_dist < self.pendulum_hit_threshold:
+                    self.pendulum_period_ticks = self.pendulum_timer - self.pendulum_first_hit_time
+                    self.get_logger().info(f"PENDULUM: Gate 2 returned. Period: {self.pendulum_period_ticks * 0.05}s")
+                    self.pendulum_state = "WAITING_FOR_GAP_2"
+
+            # State: WAITING_FOR_GAP_2
+            elif self.pendulum_state == "WAITING_FOR_GAP_2":
+                self.move_2D(0.0, 0.0, 0.0) # Stay still
+                if forward_dist > self.pendulum_hit_threshold:
+                    # Gap is open! Calculate speed and GO.
+                    period_sec = self.pendulum_period_ticks * 0.05
+                    if period_sec <= 0: period_sec = 3 # Safety
+                    
+                    k = 0.9 
+                    self.dynamic_move_speed = np.clip(k / period_sec, 0.1, self.max_translate_velocity)
+                    
+                    self.get_logger().info(f"PENDULUM: Gate 2 gap open! Moving at {self.dynamic_move_speed} m/s")
+                    self.pendulum_state = "PASSING_GATE_2"
+                    self.gate_pass_start_time = self.pendulum_timer # Use this to move for a bit
+            
+            # State: PASSING_GATE_2
+            elif self.pendulum_state == "PASSING_GATE_2":
+                # Move forward for 2 seconds (40 ticks) to clear the gate area
+                if (self.pendulum_timer - self.gate_pass_start_time) > 40:
+                    self.get_logger().info("PENDULUM: Cleared Gate 2. Starting final run.")
+                    self.pendulum_state = "FINAL_RUN"
+                else:
+                    self.move_2D(self.dynamic_move_speed, 0.0, 0.0)
+
+            # State: FINAL_RUN
+            elif self.pendulum_state == "FINAL_RUN":
+                # Go up and to the right
+                if directions[0] < self.pendulum_hit_threshold or directions[3] < self.detection_thresholds[3]:
+                    self.get_logger().info("PENDULUM: Final wall detected. Stopping.")
+                    self.pendulum_state = "DONE"
+                    self.move_2D(0.0, 0.0, 0.0)
+                    self.get_logger().info("DONE : BOMBOCLAT REACHED GOAL")
+                else:
+                    self.move_2D(self.move_speed, -self.move_speed, 0.0) # Up and right
+
+            # State: DONE
+            elif self.pendulum_state == "DONE":
+                self.move_2D(0.0, 0.0, 0.0) # Stay stopped
+
+            return # IMPORTANT: Exit function to avoid running obstacle logic
+        
+        # --- END OF NEW TOP-LEVEL CHECK ---
+
+
+        # --- COMBINED OBSTACLE AVOIDANCE LOGIC (for Corridor 1 AND Corridor 3 Pre-Gate) ---
         # if forward is greater than threshold go forward
         if (directions[0] > self.detection_thresholds[0] and not self.blocked_third_priority_forward):
-            # if passed second checkpoint and passing through gate (left and right are both blocked)
-            if (self.checkpoint_two and directions[1] < self.gate_detection_threshold and directions[3] < self.gate_detection_threshold) : 
-                self.swing_count += 1
-                self.move_2D(0.0, 0.0, 0.0)
-                self.get_logger().debug(f"SWINGS COUNTED {self.swing_count}")
+            
+            # This logic runs for P1 (Move Forward)
+            
+            # --- Checkpoint 3 Gate Detection ---
+            # If we are in Corridor 3 (checkpoint_two), check for the gate
+            if (self.checkpoint_two): 
+                left_dist = directions[1]
+                right_dist = directions[3]
+                
+                # Check if left and right are blocked (using the 5-degree view)
+                if left_dist < self.gate_detection_threshold and right_dist < self.gate_detection_threshold:
+                    self.get_logger().info("--- REACHED CHECKPOINT 3, STARTING PENDULUM LOGIC ---")
+                    self.checkpoint_three = True
+                    self.move_2D(0.0, 0.0, 0.0) # Stop
+                else:
+                    # Not at checkpoint 3 yet, so just move forward
+                    self.move_2D(self.move_speed, 0.0, 0.0)
             else:
+                # We are in Corridor 1, just move forward normally
                 self.move_2D(self.move_speed, 0.0, 0.0)
-                self.blocked_second_priority_forward = False
-                self.blocked_third_priority_forward = False
-                self.blocked_fourth_priority_forward = False
+            
+            # Since we successfully moved forward (or are about to), reset flags
+            self.blocked_second_priority_forward = False
+            self.blocked_third_priority_forward = False
+            self.blocked_fourth_priority_forward = False
+            
             self.get_logger().debug("STATE: NAV_FORWARD - Moving Forward")
             
         # forward is blocked, if haven't explored right (second priority) and not blocked go right
@@ -272,15 +425,38 @@ class ObstacleCourseNode(Node):
         # create direction array first
         directions = np.zeros(4)
         directions[0] = self.getMinDistanceInRange(0, 40) # forward
-        directions[1] = self.getMinDistanceInRange(90, 50) # left
         directions[2] = self.getMinDistanceInRange(180, 40) # back
-        directions[3] = self.getMinDistanceInRange(270, 50) # right
 
-        if (self.checkpoint_two) :
+        # --- NEW LOGIC for left/right scan range ---
+        if (self.checkpoint_two and not self.checkpoint_three):
+            # We are in Corridor 3, approaching Checkpoint 3 (the gate)
+            # Use narrow 5-degree view to detect gate posts
             directions[1] = self.getMinDistanceInRange(90, 5) # left
             directions[3] = self.getMinDistanceInRange(270, 5) # right
+        elif (self.checkpoint_three):
+            # We are past Checkpoint 3, in the pendulum area.
+            # Use narrow 5-degree view to avoid hitting side pendulum posts
+            directions[1] = self.getMinDistanceInRange(90, 5) # left
+            directions[3] = self.getMinDistanceInRange(270, 5) # right
+        else:
+            # We are in Corridor 1 or 2 (default)
+            directions[1] = self.getMinDistanceInRange(90, 50) # left
+            directions[3] = self.getMinDistanceInRange(270, 50) # right
 
-        self.get_logger().info(f"Pose: {self.pose} and Directions: [{directions[0]}, {directions[1]}, {directions[2]}, {directions[3]}")
+        # --- NEW ERROR LOGGING FOR CHECKPOINTS ---
+        gate_status = "NOT PASSED"
+        if self.checkpoint_three:
+            gate_status = "PASSED"
+
+        if not self.checkpoint_one:
+            self.get_logger().error("STATUS: On Checkpoint 1. Gate Status: NOT PASSED")
+        elif not self.checkpoint_two:
+            self.get_logger().error("STATUS: On Checkpoint 2. Gate Status: NOT PASSED")
+        else:
+            self.get_logger().error(f"STATUS: On Checkpoint 3. Gate Status: {gate_status}")
+        # --- END NEW LOGGING ---
+
+        self.get_logger().error(f"Pose: {self.pose} and Directions: [{directions[0]}, {directions[1]}, {directions[2]}, {directions[3]}")
 
 
         # [0.3, 0.2, inf, 0.2] OLD THRESHOLDS from CA1
@@ -362,3 +538,7 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+
+
+
+
