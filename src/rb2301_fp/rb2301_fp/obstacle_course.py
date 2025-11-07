@@ -1,5 +1,6 @@
 import numpy as np
 import rclpy
+import math
 from rclpy.node import Node
 from rclpy.logging import set_logger_level, LoggingSeverity
 from rclpy.qos import ReliabilityPolicy, QoSProfile
@@ -9,7 +10,7 @@ from geometry_msgs.msg import Twist
 from sensor_msgs.msg import LaserScan
 
 np.set_printoptions(2, suppress=True, threshold=np.inf) # Print numpy arrays to specified d.p., suppress scientific notation and do not truncate
-set_logger_level("obstaclecourse", level=LoggingSeverity.ERROR) # Configure to either LoggingSeverity.INFO or LoggingSeverity.DEBUG  
+set_logger_level("obstaclecourse", level=LoggingSeverity.DEBUG) # Configure to either LoggingSeverity.INFO or LoggingSeverity.DEBUG  
 
 class LidarNode(Node):
     def __init__(self):
@@ -27,7 +28,7 @@ class LidarNode(Node):
 
 class ObstacleCourseNode(Node):
     '''Node to navigate obstacle course, using pose from either gazebo odometer or optitrack and lidar scan data'''
-    def __init__(self, is_simulation:bool=True):
+    def __init__(self, is_simulation:bool=False):
         super().__init__('obstaclecourse')
         self.get_logger().info("Starting ObstacleCourseNode")
 
@@ -37,7 +38,7 @@ class ObstacleCourseNode(Node):
             self.max_translate_velocity = 1.4
             self.goal_coordinates = np.array((5.2, -2.6))
         else:
-            self.max_translate_velocity = 0.3 # Please keep this in place; 0.3m/s is more than fast enough 
+            self.max_translate_velocity = 0.075 # Please keep this in place; 0.3m/s is more than fast enough 
             self.goal_coordinates = np.array((5.2, -2.6))
 
         self.sub_scan = self.create_subscription(LaserScan, "scan", self.sub_scan_callback, 2) # Subscribe to LiDAR scan data
@@ -50,7 +51,7 @@ class ObstacleCourseNode(Node):
 
             self.map_sub = self.create_subscription( 
                 PoseStamped,
-                '/vrpn_mocap/bingda_003/pose',
+                '/vrpn_mocap/bingda_006/pose',
                 self.optitrack_callback, 
                 qos_profile
                 )
@@ -61,7 +62,7 @@ class ObstacleCourseNode(Node):
         self.last_scan = None
         self.pose = None
         self.move_speed = 0.3
-        self.detection_thresholds = [0.18, 0.20, 0.24, 0.20] # self boundaries # self.detection_thresholds = [0.18, 0.20, 0.24, 0.20] # self boundaries
+        self.detection_thresholds = [0.105, 0.13, 0.18, 0.13] # self boundaries GAZEBO [0.18, 0.20, 0.24, 0.20] # self boundaries GAZEBO
         self.gate_detection_threshold = 0.35 # gate boundaries
 
         # field variable to keep track of permanant blockage
@@ -131,16 +132,39 @@ class ObstacleCourseNode(Node):
         self.publisher_.publish(twist_msg)
 
     # gets the minimum distance in range of values
-    def getMinDistanceInRange(self, offset, rangeOfView):
+    def getMinDistanceInRange(self, offset, leftRangeOfView, rightRangeOfView):
         lid = self.last_scan
         currMin = lid[offset]
+        linear_distances = []
 
-        # incorporate angles from [-rangeOfView + offset, offset + rangeOfView]
-        for angle in range(1, rangeOfView):
-            currMin = min(currMin, lid[offset + angle])
-            currMin = min(currMin, lid[offset - angle])
+        for leftAngle in range(1, leftRangeOfView):
+            # use angle to calcualute
+            l = lid[offset + leftAngle]
+            if (np.isinf(l)) : continue
+            x_offset = l * math.cos(math.radians(leftAngle))
+            linear_distances.append(x_offset)
 
-        return currMin
+        for rightAngle in range(1, rightRangeOfView):
+            l = lid[offset - rightAngle]
+            if (np.isinf(l)) : continue
+            x_offset = l * math.cos(math.radians(rightAngle))
+            linear_distances.append(x_offset)
+
+        # find min alue
+        min_value = min(linear_distances)
+        return min_value
+    
+    def gate_logic(self, directions):
+        if (directions[1] > self.detection_thresholds[1]):
+            self.move_2D(0, self.move_speed, 0.0)
+            self.get_logger().debug("STATE: GATE_LOGIC - GO LEFT )")
+        elif (directions[0] > self.detection_thresholds[0]):
+            # This logic runs for P1 (Move Forward)
+            self.move_2D(self.move_speed, 0.0, 0.0)
+            self.get_logger().debug("STATE: GATE_LOGIC - GO FORWARD")
+        else:
+            self.move_2D(0.0, 0.0, 0.0)
+            self.get_logger().debug("STATE: GATE_LOGIC - LEFT AND FRONT BLOCKED")
     
     # anytime going forward, prioritize going forward, then right, then left, then all the way to the right, then go back looking for right
     def navigate_forward_logic(self, directions):
@@ -149,126 +173,7 @@ class ObstacleCourseNode(Node):
         # --- NEW TOP-LEVEL CHECK ---
         # If we are in Corridor 3 (past checkpoint_two) AND we've passed the gate (checkpoint_three),
         # run the PENDULUM logic exclusively.
-        if (self.checkpoint_two and self.checkpoint_three):
-            
-            # --- PENDULUM STATE MACHINE (Runs only after checkpoint_three is True) ---
-            forward_dist = directions[0]
-            self.pendulum_timer += 1 # Increment timer every tick (0.05s)
-            
-            # State: APPROACHING_GATE_1
-            if self.pendulum_state == "APPROACHING_GATE_1":
-                approaching_speed = self.move_speed / 4.0 # Move at 1/4 speed
-
-                if forward_dist < self.pendulum_hit_threshold:
-                    self.get_logger().info("PENDULUM: Hit Gate 1. Stopping to time.")
-                    self.pendulum_state = "TIMING_GATE_1_WAIT_FOR_AWAY"
-                    self.pendulum_first_hit_time = self.pendulum_timer
-                    self.move_2D(0.0, 0.0, 0.0)
-                else:
-                    self.move_2D(approaching_speed, 0.0, 0.0) # Approach gate 1 slowly
-
-            # State: TIMING_GATE_1_WAIT_FOR_AWAY
-            elif self.pendulum_state == "TIMING_GATE_1_WAIT_FOR_AWAY":
-                self.move_2D(0.0, 0.0, 0.0) # Stay still
-                if forward_dist > self.pendulum_hit_threshold:
-                    self.get_logger().info("PENDULUM: Gate 1 swinging away.")
-                    self.pendulum_state = "TIMING_GATE_1_WAIT_FOR_RETURN"
-
-            # State: TIMING_GATE_1_WAIT_FOR_RETURN
-            elif self.pendulum_state == "TIMING_GATE_1_WAIT_FOR_RETURN":
-                self.move_2D(0.0, 0.0, 0.0) # Stay still
-                if forward_dist < self.pendulum_hit_threshold:
-                    self.pendulum_period_ticks = self.pendulum_timer - self.pendulum_first_hit_time
-                    self.get_logger().info(f"PENDULUM: Gate 1 returned. Period: {self.pendulum_period_ticks * 0.05}s")
-                    self.pendulum_state = "WAITING_FOR_GAP_1"
-
-            # State: WAITING_FOR_GAP_1
-            elif self.pendulum_state == "WAITING_FOR_GAP_1":
-                self.move_2D(0.0, 0.0, 0.0) # Stay still
-                if forward_dist > self.pendulum_hit_threshold:
-                    # Gap is open! Calculate speed and GO.
-                    period_sec = self.pendulum_period_ticks * 0.05
-                    if period_sec <= 0: period_sec = 3 # Safety for divide by zero
-                    
-                    # k = base_speed * base_period = 0.3 * 3s = 0.9 (Assuming base 3s period)
-                    # Speed is inversely proportional to period: speed = k / period
-                    # A fast swing (2s) = 0.9/2 = 0.45 (clipped to 0.3)
-                    # A slow swing (5s) = 0.9/5 = 0.18
-                    k = 0.9 
-                    self.dynamic_move_speed = np.clip(k / period_sec, 0.1, self.max_translate_velocity)
-                    
-                    self.get_logger().info(f"PENDULUM: Gate 1 gap open! Moving at {self.dynamic_move_speed} m/s")
-                    self.pendulum_state = "PASSING_GATE_1"
-                    self.move_2D(self.dynamic_move_speed, 0.0, 0.0)
-
-            # State: PASSING_GATE_1
-            elif self.pendulum_state == "PASSING_GATE_1":
-                if forward_dist < self.pendulum_hit_threshold:
-                    # We hit Gate 2
-                    self.get_logger().info("PENDULUM: Hit Gate 2. Stopping to time.")
-                    self.pendulum_state = "TIMING_GATE_2_WAIT_FOR_AWAY"
-                    self.pendulum_first_hit_time = self.pendulum_timer
-                    self.move_2D(0.0, 0.0, 0.0)
-                else:
-                    self.move_2D(self.dynamic_move_speed, 0.0, 0.0) # Keep moving
-
-            # --- (Repeat logic for Gate 2) ---
-
-            # State: TIMING_GATE_2_WAIT_FOR_AWAY
-            elif self.pendulum_state == "TIMING_GATE_2_WAIT_FOR_AWAY":
-                self.move_2D(0.0, 0.0, 0.0) # Stay still
-                if forward_dist > self.pendulum_hit_threshold:
-                    self.get_logger().info("PENDULUM: Gate 2 swinging away.")
-                    self.pendulum_state = "TIMING_GATE_2_WAIT_FOR_RETURN"
-
-            # State: TIMING_GATE_2_WAIT_FOR_RETURN
-            elif self.pendulum_state == "TIMING_GATE_2_WAIT_FOR_RETURN":
-                self.move_2D(0.0, 0.0, 0.0) # Stay still
-                if forward_dist < self.pendulum_hit_threshold:
-                    self.pendulum_period_ticks = self.pendulum_timer - self.pendulum_first_hit_time
-                    self.get_logger().info(f"PENDULUM: Gate 2 returned. Period: {self.pendulum_period_ticks * 0.05}s")
-                    self.pendulum_state = "WAITING_FOR_GAP_2"
-
-            # State: WAITING_FOR_GAP_2
-            elif self.pendulum_state == "WAITING_FOR_GAP_2":
-                self.move_2D(0.0, 0.0, 0.0) # Stay still
-                if forward_dist > self.pendulum_hit_threshold:
-                    # Gap is open! Calculate speed and GO.
-                    period_sec = self.pendulum_period_ticks * 0.05
-                    if period_sec <= 0: period_sec = 3 # Safety
-                    
-                    k = 0.9 
-                    self.dynamic_move_speed = np.clip(k / period_sec, 0.1, self.max_translate_velocity)
-                    
-                    self.get_logger().info(f"PENDULUM: Gate 2 gap open! Moving at {self.dynamic_move_speed} m/s")
-                    self.pendulum_state = "PASSING_GATE_2"
-                    self.gate_pass_start_time = self.pendulum_timer # Use this to move for a bit
-            
-            # State: PASSING_GATE_2
-            elif self.pendulum_state == "PASSING_GATE_2":
-                # Move forward for 2 seconds (40 ticks) to clear the gate area
-                if (self.pendulum_timer - self.gate_pass_start_time) > 40:
-                    self.get_logger().info("PENDULUM: Cleared Gate 2. Starting final run.")
-                    self.pendulum_state = "FINAL_RUN"
-                else:
-                    self.move_2D(self.dynamic_move_speed, 0.0, 0.0)
-
-            # State: FINAL_RUN
-            elif self.pendulum_state == "FINAL_RUN":
-                # Go up and to the right
-                if directions[0] < self.pendulum_hit_threshold or directions[3] < self.detection_thresholds[3]:
-                    self.get_logger().info("PENDULUM: Final wall detected. Stopping.")
-                    self.pendulum_state = "DONE"
-                    self.move_2D(0.0, 0.0, 0.0)
-                    self.get_logger().info("DONE : BOMBOCLAT REACHED GOAL")
-                else:
-                    self.move_2D(self.move_speed, -self.move_speed, 0.0) # Up and right
-
-            # State: DONE
-            elif self.pendulum_state == "DONE":
-                self.move_2D(0.0, 0.0, 0.0) # Stay stopped
-
-            return # IMPORTANT: Exit function to avoid running obstacle logic
+        # if (self.checkpoint_two and self.checkpoint_three): 
         
         # --- END OF NEW TOP-LEVEL CHECK ---
 
@@ -278,24 +183,7 @@ class ObstacleCourseNode(Node):
         if (directions[0] > self.detection_thresholds[0] and not self.blocked_third_priority_forward):
             
             # This logic runs for P1 (Move Forward)
-            
-            # --- Checkpoint 3 Gate Detection ---
-            # If we are in Corridor 3 (checkpoint_two), check for the gate
-            if (self.checkpoint_two): 
-                left_dist = directions[1]
-                right_dist = directions[3]
-                
-                # Check if left and right are blocked (using the 5-degree view)
-                if left_dist < self.gate_detection_threshold and right_dist < self.gate_detection_threshold:
-                    self.get_logger().info("--- REACHED CHECKPOINT 3, STARTING PENDULUM LOGIC ---")
-                    self.checkpoint_three = True
-                    self.move_2D(0.0, 0.0, 0.0) # Stop
-                else:
-                    # Not at checkpoint 3 yet, so just move forward
-                    self.move_2D(self.move_speed, 0.0, 0.0)
-            else:
-                # We are in Corridor 1, just move forward normally
-                self.move_2D(self.move_speed, 0.0, 0.0)
+            self.move_2D(self.move_speed, 0.0, 0.0)
             
             # Since we successfully moved forward (or are about to), reset flags
             self.blocked_second_priority_forward = False
@@ -419,9 +307,8 @@ class ObstacleCourseNode(Node):
             raise SystemExit
         
         ###### INSERT CODE HERE ######
-        
-        # self.move_2D(0.1)
 
+        ''' GAZEBO
         # create direction array first
         directions = np.zeros(4)
         directions[0] = self.getMinDistanceInRange(0, 40) # forward
@@ -442,6 +329,14 @@ class ObstacleCourseNode(Node):
             # We are in Corridor 1 or 2 (default)
             directions[1] = self.getMinDistanceInRange(90, 50) # left
             directions[3] = self.getMinDistanceInRange(270, 50) # right
+        '''
+
+        # REAL LIFE
+        directions = np.zeros(4)
+        directions[0] = self.getMinDistanceInRange(0, 50, 50) # forward
+        directions[1] = self.getMinDistanceInRange(90, 60, 15) # left
+        directions[2] = self.getMinDistanceInRange(180, 35, 35) # back
+        directions[3] = self.getMinDistanceInRange(270, 15, 60) # right
 
         # --- NEW ERROR LOGGING FOR CHECKPOINTS ---
         gate_status = "NOT PASSED"
@@ -458,7 +353,6 @@ class ObstacleCourseNode(Node):
 
         self.get_logger().error(f"Pose: {self.pose} and Directions: [{directions[0]}, {directions[1]}, {directions[2]}, {directions[3]}")
 
-
         # [0.3, 0.2, inf, 0.2] OLD THRESHOLDS from CA1
         blocked_info = ""
         # print debugging line
@@ -473,26 +367,35 @@ class ObstacleCourseNode(Node):
 
         self.get_logger().debug(blocked_info)
 
+        # '''
         # INTENDED
         # if pose is within forward part of zig zag, prioritize up
         # TRIGGER LINE 1 : y is 1.2 (slightl later becuase circle can spawn in middle -> should not optimzie for gazebo)
+            # REAL LIFE 1 : y is 0.8
         # TRIGGER LINE 2 : x -1.8 (more aggresive should go forward no buggy circle to worry about)
+            # REAL LIFE 2 : X - 0.6 
+        trigger_lines = [1.30, -1.3, 1.9]
         # else, prioritize right
         if (not self.checkpoint_one):
             # we are in Corridor 1
             self.intended_corridor = "NAV_FORWARD"
-            if (self.pose[0] > 1.2): # Check for exit condition
+            if (self.pose[0] > trigger_lines[0]): # Check for exit condition
                 self.checkpoint_one = True
                 self.get_logger().info("--- COMPLETED CORRIDOR 1, ENTERING CORRIDOR 2 ---")
         elif (not self.checkpoint_two):
             # we are in Corridor 2
             self.intended_corridor = "NAV_RIGHT"
-            if (self.pose[1] < -1.8): # Check for exit condition
+            if (self.pose[1] < trigger_lines[1]): # Check for exit condition
                 self.checkpoint_two = True
                 self.get_logger().info("--- COMPLETED CORRIDOR 2, ENTERING CORRIDOR 3 ---")
-        else:
+        elif (not self.checkpoint_three):
             # we are in Corridor 3
-            self.intended_corridor = "NAV_FORWARD"     
+            self.intended_corridor = "NAV_FORWARD"  
+            if (self.pose[0] > trigger_lines[2]): # Check for exit condition
+                self.checkpoint_three = True
+                self.get_logger().info("--- COMPLETED CORRIDOR 3, ENTERING CORRIDOR 4 ---")   
+        else: # gate logic
+            self.intended_corridor = "GATE LOGIC"
 
         # 2. If we aren't backtracking, follow the intended corridor
         if "BACKTRACK" not in self.current_state:
@@ -507,11 +410,13 @@ class ObstacleCourseNode(Node):
             self.backtrack_from_forward_logic(directions)
         elif self.current_state == "BACKTRACK_FROM_RIGHT":
             self.backtrack_from_right_logic(directions)
-
-
+        elif self.current_state == "GATE LOGIC":
+            self.gate_logic(directions)
+        
         self.get_logger().debug(str(self.pose[2]))
 
         # again want to constanatly move up and right
+        # '''
 
         ###### INSERT CODE HERE ######
                 
