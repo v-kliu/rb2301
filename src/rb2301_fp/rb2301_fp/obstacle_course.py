@@ -62,7 +62,7 @@ class ObstacleCourseNode(Node):
         self.last_scan = None
         self.pose = None
         self.move_speed = 0.3
-        self.detection_thresholds = [0.105, 0.13, 0.18, 0.13] # self boundaries GAZEBO [0.18, 0.20, 0.24, 0.20] # self boundaries GAZEBO
+        self.detection_thresholds = [0.12, 0.12, 0.19, 0.12] # self boundaries GAZEBO [0.18, 0.20, 0.24, 0.20] # self boundaries GAZEBO
         self.gate_detection_threshold = 0.35 # gate boundaries
 
         # field variable to keep track of permanant blockage
@@ -92,6 +92,16 @@ class ObstacleCourseNode(Node):
         self.current_state = "NAV_FORWARD" 
         self.intended_corridor = "NAV_FORWARD"
 
+        self.end = False
+        self.pendStart = False
+
+        self.target = 0.0
+        self.movingFirst = False
+        self.movingSecond = False
+        self.finishedFirst = False
+        self.finishedSecond = False
+        self.clearPendulum = False
+
     def sub_scan_callback(self, msg):
         """Scan subscriber"""
         if len(msg.ranges) <= 360:
@@ -108,9 +118,11 @@ class ObstacleCourseNode(Node):
     def optitrack_callback(self, msg:PoseStamped):
         '''Callback to calculate 2D pose info from Optitrack node. Pose info includes x and y coordinates, as well as heading in degrees.
         This callback will run everytime the rclpy executor spins'''
+        print("calling optitrack")
         x, y = msg.pose.position.x, msg.pose.position.y
         heading = np.rad2deg(self.yaw_from_quaternion(msg.pose.orientation))
         self.pose = np.array((x,y,heading))
+        print("updated from optitrack", x, y, heading, self.pose)
         return self.pose
 
     def odometer_callback(self, msg):
@@ -121,11 +133,22 @@ class ObstacleCourseNode(Node):
         self.pose = np.array((latest_pose_msg.position.x, latest_pose_msg.position.y, heading))
         return self.pose
 
-    def move_2D(self, x:float=0.0, y:float=0.0, turn:float=0.0):
+    def move_2D(self, x:float=0.0, y:float=0.0, turn:float=0.0, pend = False):
         '''Publishes a Twist message to ROS to move a robot. Inputs are x and y linear velocities, as well as turn (z-axis yaw) angular velocity.'''
         twist_msg = Twist()
-        x = np.clip(x, -self.max_translate_velocity, self.max_translate_velocity)
-        y = np.clip(y, -self.max_translate_velocity, self.max_translate_velocity)
+        clip_vel = self.max_translate_velocity
+        # x = np.clip(x, -self.max_translate_velocity, self.max_translate_velocity)
+        # y = np.clip(y, -self.max_translate_velocity, self.max_translate_velocity)
+        if pend:
+            clip_vel = 0.3
+        x = np.clip(x, -clip_vel, clip_vel)
+        y = np.clip(y, -clip_vel, clip_vel)
+
+        # x, y = 0.0, 0.0
+
+        turn = self.pid_heading()
+        print("velocities:", x, y, turn)
+
         turn = np.clip(turn, -self.max_translate_velocity*2, self.max_translate_velocity*2)
         twist_msg.linear.x, twist_msg.linear.y, twist_msg.linear.z = float(x), float(y), 0.0
         twist_msg.angular.x, twist_msg.angular.y, twist_msg.angular.z = 0.0, 0.0, float(turn)
@@ -151,14 +174,103 @@ class ObstacleCourseNode(Node):
             linear_distances.append(x_offset)
 
         # find min alue
-        min_value = min(linear_distances)
+        if linear_distances:
+            min_value = min(linear_distances)
+        else:
+            min_value = 5
         return min_value
     
+    def pid(self):
+        print("moving to waypoint", self.target, "current x is", self.pose[0])
+        # errorX = self.nextX - self.currMapX
+        # errorY = self.nextY - self.currMapY
+        errorX = self.target - self.pose[0]
+
+
+        print("errors", errorX)
+        # if abs(errorX) <= 0.5 and abs(errorY) <= 0.5:
+        moveX = 2 * errorX
+        print("moving with", moveX)
+        self.move_2D(moveX, 0.0, 0.0, True)
+
+    def pid_heading(self):
+        print("heading calc")
+        error = self.pose[2]
+        angularVel = 0
+        if abs(error) >= 1:
+            print("correction needed", error)
+            angularVel = error * -0.1
+        return angularVel
+
+    # # amos 
     def gate_logic(self, directions):
-        if (directions[1] > self.detection_thresholds[1]):
+        left = self.getMinDistanceInRange(90, 55, 15) # left
+        back = self.getMinDistanceInRange(180, 15, 15) # back
+        val_front = self.getMinDistanceInRange(0, 20, 20)
+        print(left, back, val_front)
+        if (left > 0.14) and not self.clearPendulum: #self.detection_thresholds[1]):
             self.move_2D(0, self.move_speed, 0.0)
             self.get_logger().debug("STATE: GATE_LOGIC - GO LEFT )")
-        elif (directions[0] > self.detection_thresholds[0]):
+        elif (back < 0.27) or self.clearPendulum:
+            front = self.getMinDistanceInRange(0, 0, 20)
+            
+            self.clearPendulum = True
+            if not self.end: #we havent started frequency tracking
+                print("not done")
+                print("current front", front)
+                if not self.finishedFirst: #prepare for frequency calculation
+                    print("Working on first bound")
+                    if not self.pendStart: # havent encountered pendulum passing since the time we set getFreuqency as True
+                        self.move_2D(0.0, 0.0, 0.0)
+                        #check if we encounter pendulum blocking
+                        print("havent detected first pendulum")
+                        if front < 0.30: #first encounter of first pendulum blocking robot
+                            self.pendStart = True #trigger frequency calculation
+                            print("detected first pendulum")
+                    elif not self.movingFirst:
+                        print("not yet moving first pendulum")
+                        if front > 0.30: #pendulum not reached back
+                            self.target = self.pose[0] + 0.6
+                            self.movingFirst = True
+                            print("triggering moving past first pendulum")
+                    elif abs(self.pose[0] - self.target) >= 0.03 and front > 0.15: #not yet within desired threshold past first bound
+                        #we have already ensured pendulum moved past robot and immediately triggered movement (self.movingFirst)
+                        self.pid() #trigger movement past first bound
+                        print("in progress - moving past first pendulum")
+                    else: #we have started pendulum, triggered movement, and made it past first bound within acceptable threshold (0.03)
+                        print("sufficiently past first pendulum")
+                        self.finishedFirst = True
+                        self.pendStart = False
+                        self.move_2D(0.0, 0.0, 0.0)
+                elif not self.finishedSecond: #prepare for frequency calculation
+                    print("Working on second bound")
+                    if not self.pendStart: # havent encountered pendulum passing since the time we set getFreuqency as True
+                        self.move_2D(0.0, 0.0, 0.0)
+                        #check if we encounter pendulum blocking
+                        print("havent detected second pendulum")
+                        if front < 0.30: #first encounter of second pendulum blocking robot
+                            self.pendStart = True #trigger frequency calculation
+                            print("detected second pendulum")
+                    elif not self.movingSecond:
+                        print("not yet moving first pendulum")
+                        if front > 0.30: #pendulum not reached back
+                            self.target = self.pose[0] + 0.5
+                            self.movingSecond = True
+                            print("triggering moving past second pendulum")
+                    elif abs(self.pose[0] - self.target) >= 0.03 and front > 0.18: #not yet within desired threshold past first bound
+                        #we have already ensured pendulum moved past robot and immediately triggered movement (self.movingFirst)
+                        self.pid() #trigger movement past first bound
+                        print("in progress - moving past second pendulum")
+                    else: #we have started pendulum, triggered movement, and made it past second bound within acceptable threshold (0.03)
+                        print("sufficiently past second pendulum")
+                        self.finishedSecond = True
+                        self.move_2D(0.0, 0.0, 0.0)
+                else: #havent triggered frequency calculation
+                    self.end = True
+            else:
+                # print("obtained frequency:", self.freqCalc)
+                print("done with all pendulums")
+        elif (val_front > self.detection_thresholds[0]):
             # This logic runs for P1 (Move Forward)
             self.move_2D(self.move_speed, 0.0, 0.0)
             self.get_logger().debug("STATE: GATE_LOGIC - GO FORWARD")
@@ -333,10 +445,10 @@ class ObstacleCourseNode(Node):
 
         # REAL LIFE
         directions = np.zeros(4)
-        directions[0] = self.getMinDistanceInRange(0, 50, 50) # forward
-        directions[1] = self.getMinDistanceInRange(90, 60, 15) # left
+        directions[0] = self.getMinDistanceInRange(0, 45, 45) # forward
+        directions[1] = self.getMinDistanceInRange(90, 60, 30) # left
         directions[2] = self.getMinDistanceInRange(180, 35, 35) # back
-        directions[3] = self.getMinDistanceInRange(270, 15, 60) # right
+        directions[3] = self.getMinDistanceInRange(270, 30, 60) # right
 
         # --- NEW ERROR LOGGING FOR CHECKPOINTS ---
         gate_status = "NOT PASSED"
@@ -356,13 +468,13 @@ class ObstacleCourseNode(Node):
         # [0.3, 0.2, inf, 0.2] OLD THRESHOLDS from CA1
         blocked_info = ""
         # print debugging line
-        if (directions[0] > self.detection_thresholds[0]) : blocked_info += "FRONT NOT BLOCKED, "
+        if (directions[0] > self.detection_thresholds[0]) : blocked_info += "FRONT NOT BLOCKED, "+ str(directions[0])
         else : blocked_info += "FRONT BLOCKED (" + str(directions[0]) + "), "
-        if (directions[3] > self.detection_thresholds[3]) : blocked_info += "RIGHT NOT BLOCKED, "
+        if (directions[3] > self.detection_thresholds[3]) : blocked_info += "RIGHT NOT BLOCKED, "+ str(directions[3])
         else : blocked_info += "RIGHT BLOCKED (" + str(directions[3]) + "), "
-        if (directions[1] > self.detection_thresholds[1]) : blocked_info += "LEFT NOT BLOCKED, "
+        if (directions[1] > self.detection_thresholds[1]) : blocked_info += "LEFT NOT BLOCKED, "+ str(directions[1])
         else: blocked_info += "LEFT BLOCKED (" + str(directions[1]) + "), "
-        if (directions[2] > self.detection_thresholds[2]) : blocked_info += "BACK NOT BLOCKED"
+        if (directions[2] > self.detection_thresholds[2]) : blocked_info += "BACK NOT BLOCKED"+ str(directions[2])
         else : blocked_info += "BACK BLOCKED (" + str(directions[2]) + "), "
 
         self.get_logger().debug(blocked_info)
@@ -412,6 +524,8 @@ class ObstacleCourseNode(Node):
             self.backtrack_from_right_logic(directions)
         elif self.current_state == "GATE LOGIC":
             self.gate_logic(directions)
+
+        # self.gate_logic(directions)
         
         self.get_logger().debug(str(self.pose[2]))
 
@@ -443,7 +557,6 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-
 
 
 
